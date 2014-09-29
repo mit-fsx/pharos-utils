@@ -1,0 +1,338 @@
+#!/usr/bin/perl -w
+#
+# Script to control Omegas remotely
+# Author: Jonathan Reed <jdreed@mit.edu>
+# Copyright (c) 2011, Massachusetts Institute of Technology
+# Licensed under the GNU General Public License, 2.0
+# the text of which may be found at:
+#     http://www.gnu.org/licenses/gpl-2.0.html
+#
+# Requirements:
+# - Perl 5.8 or later
+# - Term::ReadKey CPAN module
+
+$| = 1;
+
+use strict;
+use Term::ReadKey;
+use Term::ReadLine;
+use LWP::UserAgent 6;   
+#LWP 6 is less stupid about SSL
+use HTML::Strip;
+use File::Basename;
+use Getopt::Std;
+use Net::Ping;
+
+# Hardcoded in PS200s and PS150s
+my $_salt = 'Px';
+
+my $DEBUG = 0;
+my $USESSL = 1;
+
+# The Omega certificate lists "PS" as the hostname.
+# Also, it's self-signed.  "Yay"
+my $lwp = LWP::UserAgent->new(ssl_opts => { verify_hostname => 0 });
+$lwp->timeout(10);
+
+my $hs = HTML::Strip->new(emit_spaces => 0);
+my $pinger = Net::Ping->new('tcp', 1);  # 'icmp' requires root
+
+sub debug {
+    return unless $DEBUG;
+    my $msg = shift || '';
+    print "DEBUG: $msg\n";
+}
+
+sub usage {
+    printf "Usage: %s [-d] [-n] hostname-or-ip\n", basename($0);
+    exit 1;
+}
+
+sub trim {
+    my $s = shift;
+    $s =~ s/^\s+//g;
+    $s =~ s/\s+$//g;
+    return $s;
+}
+
+sub stripNoReally {
+    my $content = shift;
+    # Sigh.  Bug in HTML::Strip triggers a tag start on the less-than
+    # operator in JS.
+    $content =~ s|<script>.*?</script>||s;
+    my $stripped = $hs->parse($content);
+    $stripped =~ s/^\s+//gm;
+    $stripped =~ s/\s+$//gm;
+    $hs->eof();
+    return $stripped;
+}
+
+sub getModel {
+    my $hostname = shift;
+    # Try a PS150.  There's probably a better way.
+    my $response = $lwp->get("http://${hostname}:8080/python/admin/prelogin");
+    if ($response->is_success) {
+	my $stripped = stripNoReally($response->decoded_content);
+	if ($stripped =~ /^Omega PS150 Administrator$/m) {
+	    return "PS150";
+	} elsif ($stripped =~ /^Omega Administrator$/m) {
+	    return "PS150"; #older firmware
+	}
+    } elsif ($response->code eq '404') {
+	$response = $lwp->get("http://${hostname}:8080/cgi-bin/admin?page=login.sh");
+	if ($response->is_success) {
+	    if (stripNoReally($response->decoded_content) =~ /^Omega PS200 Administrator$/m) {
+		return "PS200";
+	    }
+	}
+    }
+    return "UNKNOWN";
+}
+
+sub getURL {
+    my $hostname = shift;
+    my $secure = shift || $USESSL;
+    return sprintf("%s://%s:%s/cgi-bin/admin", $secure ? 'https' : 'http', $hostname, $secure ? '8443' : '8080');
+}
+
+sub testLogin {
+    my $hostname = shift;
+    my $hash = shift;
+    my %formdata = (page => 'line.sh',
+		    hash => $hash);
+    my $response = $lwp->post(getURL($hostname),
+			      \%formdata);
+    print "Testing password...";
+    if ($response->is_success) {
+	if (stripNoReally($response->decoded_content) =~ /^Running/) {
+	    print "OK\n";
+	    return 1;
+	} else {
+	    print "INCORRECT\n";
+	    return 0;
+	}
+    } else {
+	print "Connection failed: " . $response->status_line;
+	return 0;
+    }
+}
+
+sub getFile {
+    my $hostname = shift;
+    my $hash = shift;
+    my $filename = shift;
+    my $localfile = shift || $filename;
+    my %formdata = (page => 'files.sh',
+		    hash => $hash,
+		    op => 'retrieve',
+		    targetfile => $filename);
+    if ($localfile ne '-') {
+	$localfile =~ s/\W/_/g;
+    }
+    my $response = $lwp->post(getURL($hostname),
+			      \%formdata);
+    print "Fetching $filename from $hostname...\n";
+    if ($response->is_success) {
+	if (($response->header('Content-Disposition') || '' ) !~ /^attachment/) {
+	    print "Error: " . stripNoReally($response->decoded_content);
+	} else {
+	    if ($localfile eq '-') {
+		print $response->decoded_content;
+	    } else {
+		print "Saving to $localfile...";
+		if (! open(OUT, ">$localfile")) {
+		    print "Cannot write to $localfile: $!\n";
+		    return 0;
+		}
+		print OUT $response->decoded_content;
+		if (! close(OUT)) {
+		    print "Cannot close $localfile.  Oh well.\n";
+		    return 0;
+		}
+		print "done\n";
+	    }
+	}
+    } else {
+	print "Connection failed: " . $response->status_line;
+	return 0;
+    }
+}
+
+sub saveFile {
+    my $hostname = shift;
+    my $hash = shift;
+    my $uploadfile = shift;
+    my $filename = shift;
+    if ($filename !~ m|^/\w+|) {
+	print "Target file ($filename) must be an absolute path.\n";
+	return 0;
+    }
+    if (! -r $uploadfile) {
+	print "Cannot read local file ($uploadfile).\n";
+	return 0;
+    }
+    print "Uploading $uploadfile to $filename on $hostname...";
+    my %formdata = (page => 'files.sh',
+		    hash => $hash,
+		    op => 'save',
+		    targetfile => $filename,
+		    uploadfile => [$uploadfile, $filename]);
+    my $response = $lwp->post(getURL($hostname),
+			      \%formdata, Content_Type => 'multipart/form-data');
+    if ($response->is_success) {
+	print $response->decoded_content;
+    } else {
+	print $response->status_line;
+	return 0;
+    }
+}
+
+
+sub reboot {
+    my $hostname = shift;
+    my $hash = shift;
+    my %formdata = (page => 'restart.sh',
+		    hash => $hash,
+		    op => 'save');
+    
+    my $response = $lwp->post(getURL($hostname),
+			      \%formdata);
+    if ($response->is_success) {
+	print $response->decoded_content;
+    } else {
+	warn $response->status_line;
+	return 0;
+    }
+}
+
+# If you get /etc/station/theme/theme.xml inline, you can push it using this.
+# Probably easier to just replace the files though.
+
+sub pushTheme {
+    my $hostname = shift;
+    my $hash = shift;
+    my $theme = shift;
+    my %formdata = (page => 'themeEdit.sh',
+		    hash => $hash,
+		    op => 'save',
+		    theme => $theme);
+    my $response = $lwp->post(getURL($hostname),
+			      \%formdata);
+    if ($response->is_success) {
+	my $stripped = trim($hs->parse($response->decoded_content));
+	$hs->eof();
+	if ($stripped eq 'Login failed') {
+	    print "ERROR: Password incorrect when pushing theme to $hostname\n";
+	}
+	if ($stripped =~ /^can not execute/) {
+	    print "ERROR: Can't run script - wrong Omega model?\n";
+	}
+	if ($stripped eq 'Theme saved.') {
+	    return 1;
+	}
+    } else {
+	warn $response->status_line;
+    }
+    return 0;
+}    
+
+sub inputPassword {
+    ReadMode('noecho');
+    print "Enter the Omega password: ";
+    my $password = ReadLine(0);
+    print "\n";
+    ReadMode('restore');
+    chomp $password;
+    return $password;
+}
+
+sub getHash {
+    # For now, this is crypt() with a hardcoded hash
+    # but at some point they could change the salt, in which case we
+    # could fetch it from the login page or something.
+    my $password = shift || '';
+    return crypt($password, $_salt);
+}
+
+sub printHelp {
+    print <<END;
+get remote-filename [-|local-filename]
+  Retrieve remote-filename and display it on stdout (-) or save it 
+  as local-filename.
+put local-filename remote-filename
+  Send local-filename to remote-filename (must be full path).
+reboot
+  Reboot Omega.
+q|quit
+  Quit
+?|h 
+  Display this help.
+END
+}
+
+my %opts = ('d' => 0,
+	    's' => 1,
+    );
+getopts('ds:', \%opts) || usage;
+(scalar(@ARGV) >= 1) || usage;
+
+my $omega = shift(@ARGV) || '';
+($omega) || usage;
+print "Pinging $omega... ";
+if ($pinger->ping($omega)) {
+    print "OK\n";
+} else {
+    print "FAILED\n";
+    print "Continue anyway? (y/n) ";
+    if (ReadLine(0) !~ /^y$/i) {
+	exit 1;
+    }
+}
+
+my $model = getModel($omega);
+if ($model eq 'UNKNOWN') {
+    print "Can't identify model of $omega.  Can't proceed.\n";
+    exit 1;
+}
+
+my $loginok = 0;
+my $hash;
+while (! $loginok) {
+    my $password = '';
+    if ($ENV{'OMEGAPASS'}) {
+	print 'Using $OMEGAPASS...' . "\n";
+	$password = $ENV{'OMEGAPASS'};
+    } else {
+	$password = inputPassword();
+    }
+    $hash = getHash($password);
+    $loginok = testLogin($omega, $hash);
+}
+
+
+my $cmd = scalar(@ARGV) ? shift(@ARGV) : undef;
+my @args = (@ARGV);
+my $interactive = defined($cmd) ? 0 : 1;
+while (1) {
+    if (! defined($cmd)) {
+	printf "%s(%s)> ", $omega, $model;
+	my $line = ReadLine(0);
+	defined($line) || exit 0;
+	chomp $line;
+	($cmd, @args) = split(' ', $line);
+    }
+    next unless $cmd;
+    ($cmd eq 'quit') && exit 0;
+    ($cmd eq 'q') && exit 0;
+    ($cmd eq '?') && printHelp();
+    ($cmd eq 'h') && printHelp();
+    ($cmd eq 'reboot') && reboot($omega, $hash, @args);
+    ($cmd eq 'get') && getFile($omega, $hash, @args);
+    ($cmd eq 'put') && saveFile($omega, $hash, @args);
+    # TODO exit codes
+    exit 0 unless $interactive;
+    @args = ();
+    $cmd = undef;
+}
+exit 0;
+
